@@ -215,9 +215,9 @@ bc_walls = HalfwayBounceBackBC(indices=walls)
 # bc_ground = FullwayBounceBackBC(indices=grid.boundary_indices_across_levels(level_data, box_side="front"))
 # bc_outlet = ExtrapolationOutflowBC(indices=outlet)
 bc_outlet = DoNothingBC(indices=outlet)
-# bc_sphere = HalfwayBounceBackBC(mesh_vertices=sphere, voxelization_method=MeshVoxelizationMethod.AABB)
+# bc_sphere = HalfwayBounceBackBC(mesh_vertices=sphere, voxelization_method=MeshVoxelizationMethod('AABB'))
 bc_sphere = HybridBC(
-    bc_method="nonequilibrium_regularized", mesh_vertices=sphere, voxelization_method=MeshVoxelizationMethod.AABB, use_mesh_distance=True
+    bc_method="nonequilibrium_regularized", mesh_vertices=sphere, voxelization_method=MeshVoxelizationMethod("AABB"), use_mesh_distance=True
 )
 
 boundary_conditions = [bc_walls, bc_left, bc_outlet, bc_sphere]
@@ -227,11 +227,11 @@ visc = u_max * num_finest_voxels_across_part / Re
 omega = 1.0 / (3.0 * visc + 0.5)
 
 # Make initializer operator
-from xlb.helper.initializers import MultiresOutletInitializer
+from xlb.helper.initializers import CustomMultiresInitializer
 
-initializer = MultiresOutletInitializer(
-    outlet_bc_id=bc_outlet.id,
-    wind_vector=(u_max, 0.0, 0.0),
+initializer = CustomMultiresInitializer(
+    bc_id=bc_outlet.id,
+    constant_velocity_vector=(u_max, 0.0, 0.0),
     velocity_set=velocity_set,
     precision_policy=precision_policy,
     compute_backend=compute_backend,
