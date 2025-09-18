@@ -111,7 +111,7 @@ def prepare_sparsity_pattern(level_data):
 
 # The following parameters define the resolution of the voxelized grid
 sphere_radius = 5
-num_finest_voxels_across_part = 2 * sphere_radius
+num_finest_voxels_across_part = 1 * sphere_radius
 
 # Other setup parameters
 Re = 5000.0
@@ -119,7 +119,8 @@ compute_backend = ComputeBackend.NEON
 precision_policy = PrecisionPolicy.FP32FP32
 velocity_set = xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=compute_backend)
 u_max = 0.04
-num_steps = 10000
+# num_steps = 10000
+num_steps = 1
 post_process_interval = 1000
 
 # Initialize XLB
@@ -138,7 +139,7 @@ level_data, sphere, grid_shape_finest = generate_cuboid_mesh(stl_filename, num_f
 from xlb.utils import MultiresIO
 
 # Define an exporter for the multiresolution data
-exporter = MultiresIO({"velocity": 3, "density": 1}, level_data)
+exporter = MultiresIO({"velocity": 3, "density": 1, "bc_mask": 1}, level_data)
 
 # Prepare the sparsity pattern and origins from the level data
 sparsity_pattern, level_origins = prepare_sparsity_pattern(level_data)
@@ -217,7 +218,7 @@ bc_walls = HalfwayBounceBackBC(indices=walls)
 bc_outlet = DoNothingBC(indices=outlet)
 # bc_sphere = HalfwayBounceBackBC(mesh_vertices=sphere, voxelization_method=MeshVoxelizationMethod('AABB'))
 bc_sphere = HybridBC(
-    bc_method="nonequilibrium_regularized", mesh_vertices=sphere, voxelization_method=MeshVoxelizationMethod("AABB"), use_mesh_distance=True
+    bc_method="nonequilibrium_regularized", mesh_vertices=sphere, voxelization_method=MeshVoxelizationMethod("AABB_CLOSE", close_voxels=1), use_mesh_distance=True
 )
 
 boundary_conditions = [bc_walls, bc_left, bc_outlet, bc_sphere]
@@ -286,7 +287,7 @@ for step in range(num_steps):
         nx, ny, nz = grid_shape_finest
         filename = f"multires_flow_over_sphere_3d_{step:04d}"
         wp.synchronize()
-        exporter.to_hdf5(filename, {"velocity": sim.u, "density": sim.rho}, compression="gzip", compression_opts=2)
+        exporter.to_hdf5(filename, {"velocity": sim.u, "density": sim.rho, "bc_mask": sim.bc_mask}, compression="gzip", compression_opts=2)
         exporter.to_slice_image(
             filename,
             {"velocity": sim.u},

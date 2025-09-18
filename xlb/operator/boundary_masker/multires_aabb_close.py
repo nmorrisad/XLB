@@ -7,7 +7,7 @@ from xlb.compute_backend import ComputeBackend
 from xlb.operator.boundary_masker import MeshMaskerAABBClose
 from xlb.operator.operator import Operator
 import neon
-
+import sys
 
 # Create a list of the connected components
 def find_connected_components(connectivity):
@@ -136,6 +136,12 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                         max_length = wp.length(dir_vec)
                         # Avoid division by zero for any pathological dir (shouldn't happen)
                         norm_dir = dir_vec / (max_length if max_length > 0.0 else 1.0)
+                        # wp.print(cell_center)
+                        if not cell_center == cell_center:
+                            wp.print("Cell center is NaN!")
+                        if not norm_dir == norm_dir:
+                            wp.print("norm_dir is NaN!")
+                        # cell_center = wp.vec3f(0.0,0.0,0.0)
                         query = wp.mesh_query_ray(mesh_id, cell_center, norm_dir, 1.5 * max_length)
                         if query.result:
                             pos_mesh = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
@@ -175,6 +181,60 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
             return
         
         @wp.func
+        def mres_get_wall_seeds(
+            index: Any,
+            solid_mask_pn: Any,  # mPartition_uint8, cardinality=1
+            flood_mask_pn: Any,  # mPartition_uint8, cardinality=1
+            num_seeds: wp.int32, 
+            seed_count: Any,  # mPartition_int32, cardinality=1
+        ):
+            solid_val = wp.neon_read(solid_mask_pn, index, 0)
+            # If solid and not yet flooded, check if seed
+            if solid_val == wp.uint8(255):
+                # Check neighbors for case where we have two opposite fluid voxels touching a solid wall
+                # There are three cases:
+                wall_seed = False
+                for d in range(3):
+                    dir = wp.vec3i(0,0,0)
+                    dir[d] = 1
+                    ngh = wp.neon_ngh_idx(wp.int8(dir.x), wp.int8(dir.y), wp.int8(dir.z))
+                    ngh_opp = wp.neon_ngh_idx(wp.int8(-dir.x), wp.int8(-dir.y), wp.int8(-dir.z))
+                    is_valid = wp.bool(False)
+                    is_valid_opp = wp.bool(False)
+                    ngh_val = wp.neon_read_ngh(solid_mask_pn, index, ngh, 0, wp.uint8(0), is_valid)
+                    ngh_val_opp = wp.neon_read_ngh(solid_mask_pn, index, ngh_opp, 0, wp.uint8(0), is_valid_opp)
+                    if is_valid and is_valid_opp:
+                        if ngh_val != wp.uint8(255) and ngh_val_opp != wp.uint8(255):
+                            wall_solid = True
+                            # Now ensure wall in between is solid
+                            for p in range(2):
+                                for q in range(2):
+                                    wall_dir = wp.vec3i(0,0,0)
+                                    wall_dir[(d+1)%3] = p*2 - 1
+                                    wall_dir[(d+2)%3] = q*2 - 1
+                                    wall_ngh = wp.neon_ngh_idx(wp.int8(wall_dir.x), wp.int8(wall_dir.y), wp.int8(wall_dir.z))
+                                    wall_is_valid = wp.bool(False)
+                                    wall_val = wp.neon_read_ngh(solid_mask_pn, index, wall_ngh, 0, wp.uint8(0), wall_is_valid)
+                                    if wall_is_valid:
+                                        if wall_val != wp.uint8(255):
+                                            wall_solid = False
+                            if wall_solid:
+                                wall_seed = True
+                                break
+                    if wall_seed:
+                        # Create seeds on the two fluid neighbors
+                        seed_val = wp.atomic_add(seed_count, 0, 1)
+                        if seed_val < num_seeds:
+                            # Mark on flood mask
+                            self.write_field(flood_mask_pn, index + ngh, 0, wp.uint8(seed_val+1))
+                            self.write_field(flood_mask_pn, index + ngh_opp, 0, wp.uint8(2*(seed_val+1)))
+                    return            
+            # wp.neon_write(flood_mask_pn, index, 0, wp.uint8(0))
+            return
+            
+
+        
+        @wp.func
         def mres_flood_fill(
             index: Any,
             solid_mask_pn: Any,  # mPartition_uint8, cardinality=1
@@ -185,10 +245,10 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
             solid_val = self.read_field(solid_mask_pn, index, 0)
             flood_val = self.read_field(flood_mask_pn, index, 0)
 
-            if flood_val > wp.uint8(0):
-                # Already flooded, copy value to output
-                self.write_field(flood_mask_out_pn, index, 0, flood_val)
-                return
+            # if flood_val > wp.uint8(0):
+            #     # Already flooded, copy value to output
+            #     self.write_field(flood_mask_out_pn, index, 0, flood_val)
+            #     return
             if solid_val != wp.uint8(255) and flood_val == wp.uint8(0):
                 max_val = wp.uint8(0)
                 for l in range(_q):
@@ -198,8 +258,7 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                     # direction = wp.vec3i(_c[0, l], _c[1, l], _c[2, l])
                     ngh = wp.neon_ngh_idx(wp.int8(_c[0, l]), wp.int8(_c[1, l]), wp.int8(_c[2, l]))
                     ngh_val = wp.neon_read_ngh(flood_mask_pn, index, ngh, 0, wp.uint8(0), is_valid)
-                    if is_valid:
-                        max_val = wp.max(max_val, ngh_val)
+                    max_val = wp.max(max_val, ngh_val)
                     # else:
                     #     # Check to see if there is a finer neighbor that might have a value
                     #     if wp.neon_has_finer_ngh(flood_mask_pn, index, direction):
@@ -208,9 +267,12 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                 if max_val > wp.uint8(0):
                     self.write_field(flood_mask_out_pn, index, 0, max_val)
                     # self.write_field(keep_going, 0, 0, 1)
+                    # wp.print("Updating flood")
                     # wp.atomic_max(keep_going, 0, 1)
                     wp.atomic_add(keep_going, 0, 1)
+                    return
             
+            self.write_field(flood_mask_out_pn, index, 0, flood_val)
             return
         
         @wp.func
@@ -254,8 +316,11 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
             # max_check = self.read_field(max_comps, flood_val, 0)
             max_check = max_comps[flood_val]
 
-            if max_check == wp.int32(1):
+            if max_check == wp.int32(0):
+            # if max_check > 0:
+            # if flood_val > 0:
                 self.write_field(solid_mask_pn, index, 0, wp.uint8(255))
+            # self.write_field(solid_mask_pn, index, 0, flood_val)
             
             return
 
@@ -269,16 +334,16 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
                 # max_comps_pn = loader.get_mres_write_handle(max_comps)
 
                 @wp.func
-                def kernel_solid(index: Any):
+                def kernel_update_solid(index: Any):
                     mres_update_solid(index, solid_mask_pn, flood_mask_pn, max_comps)
 
-                loader.declare_kernel(kernel_solid)
+                loader.declare_kernel(kernel_update_solid)
 
             return update_launcher
 
         @neon.Container.factory(name="GetSeeds")
         def container_get_seeds(solid_mask: wp.array3d(dtype=Any), flood_mask: wp.array3d(dtype=Any), num_seeds: int, seed_count: wp.array3d(dtype=Any), level: int):
-            def erode_launcher(loader: neon.Loader):
+            def launcher(loader: neon.Loader):
                 loader.set_mres_grid(solid_mask.get_grid(), level)
                 solid_mask_pn = loader.get_mres_read_handle(solid_mask)
                 flood_mask_pn = loader.get_mres_write_handle(flood_mask)
@@ -289,7 +354,7 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
 
                 loader.declare_kernel(get_seeds_kernel)
 
-            return erode_launcher
+            return launcher
 
         @neon.Container.factory(name="FloodFill")
         def container_flood_fill(solid_mask: wp.array3d(dtype=Any), flood_mask: wp.array3d(dtype=Any), flood_mask_out: wp.array3d(dtype=Any), done: wp.array3d(dtype=Any), level: int):
@@ -443,108 +508,161 @@ class MultiresMeshMaskerAABBClose(MeshMaskerAABBClose):
 
         grid = bc_mask.get_grid()
         # Create fields using new_field
-        solid_mask = grid.new_field(cardinality=1, dtype=wp.uint8, memory_type=neon.MemoryType.device())
+        solid_mask = grid.new_field(
+            cardinality=1, 
+            dtype=wp.uint8, 
+            # memory_type=neon.MemoryType.device()
+            memory_type=neon.MemoryType.host_device()
+        )
         solid_mask_out = grid.new_field(
             cardinality=1,
             dtype=wp.uint8,
-            memory_type=neon.MemoryType.device(),
-            # memory_type=neon.MemoryType.host_device()
+            # memory_type=neon.MemoryType.device(),
+            memory_type=neon.MemoryType.host_device()
         )
 
         flood_mask = grid.new_field(
             cardinality=1,
             dtype=wp.uint8,
-            memory_type=neon.MemoryType.device(),
-            # memory_type=neon.MemoryType.host_device()
+            # memory_type=neon.MemoryType.device(),
+            memory_type=neon.MemoryType.host_device()
         )
         flood_mask_out = grid.new_field(
             cardinality=1,
             dtype=wp.uint8,
-            memory_type=neon.MemoryType.device(),
-            # memory_type=neon.MemoryType.host_device()
+            # memory_type=neon.MemoryType.device(),
+            memory_type=neon.MemoryType.host_device()
         )
         
+        # Temporary array to check if flood fill needs to continue
+
+        wp.synchronize()
+        seed_count_array = wp.zeros(1, dtype=wp.int32, device="cuda:0")
+        wp.synchronize()
+        
+        for level in range(grid.num_levels):
+            flood_mask.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
+            flood_mask_out.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
+
         for level in range(grid.num_levels):
             # Initialize to 0
-            solid_mask.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
-            solid_mask_out.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
+            # solid_mask.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
+            # solid_mask_out.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
 
             # Launch the neon containers
             container_solid = self.neon_container_dict["container_solid"](mesh_id, solid_mask, level)
             container_solid.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            wp.synchronize()
+            
+            print(f"Completed solid voxelization at level {level}")
 
-            for _ in range(self.close_voxels):
-                container_dilate = self.neon_container_dict["container_dilate"](solid_mask, solid_mask_out, level)
-                container_dilate.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
-                solid_mask, solid_mask_out = solid_mask_out, solid_mask
+            # for _ in range(self.close_voxels):
+            #     container_dilate = self.neon_container_dict["container_dilate"](solid_mask, solid_mask_out, level)
+            #     container_dilate.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            #     solid_mask, solid_mask_out = solid_mask_out, solid_mask
 
-            for _ in range(self.close_voxels):
-                container_erode = self.neon_container_dict["container_erode"](solid_mask, solid_mask_out, level)
-                container_erode.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
-                solid_mask, solid_mask_out = solid_mask_out, solid_mask
+            # for _ in range(self.close_voxels):
+            #     container_erode = self.neon_container_dict["container_erode"](solid_mask, solid_mask_out, level)
+            #     container_erode.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            #     solid_mask, solid_mask_out = solid_mask_out, solid_mask
 
             # Now do flood fill, reuse solid_mask_out as flood_mask
-            # flood_mask = solid_mask_out
-            flood_mask.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
-            flood_mask_out.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
-            num_seeds = 5
+            # flood_mask.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
+            # flood_mask_out.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
+            num_seeds = 64
             # TODO: use device 0, needs to be changed for multi-gpu
-            seed_count_array = wp.zeros(1, dtype=wp.int32)
-            if level == 0:
+            # wp.synchronize()
+            # seed_count_array = wp.zeros(1, dtype=wp.int32, device="cuda:0")
+            # wp.synchronize()
+            # if level == 0:
                 # Initialize flood seeds
-                container_get_seeds = self.neon_container_dict["container_get_seeds"](solid_mask, flood_mask, num_seeds, seed_count_array, level)
-                container_get_seeds.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+                # container_get_seeds = self.neon_container_dict["container_get_seeds"](solid_mask, flood_mask, num_seeds, seed_count_array, level)
+                # container_get_seeds.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
             
-            iters = 0
-            growth = 0
-            done = False
-            while not done:
-                # keep_going_array[0] = wp.uint8(0)
-                keep_going_array = wp.zeros(1, dtype=wp.int32)
-                container_flood = self.neon_container_dict["container_flood_fill"](solid_mask, flood_mask, flood_mask_out, keep_going_array, level)
-                container_flood.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
-                keep_going = keep_going_array.numpy()
-                growth += keep_going[0]
-                done = (keep_going[0] == 0)
-                flood_mask, flood_mask_out = flood_mask_out, flood_mask
-                # done = self.read_field(keep_going_array, 0, 0) == 0
-                print(f"Flood fill iter {iters} grew {keep_going[0]} voxels")
-                iters += 1
+            # iters = 0
+            # growth = 0
+            # done = False
+            # keep_going_array = wp.zeros(1, dtype=wp.int32)
+            # while not done:
+            #     # keep_going_array[0] = wp.uint8(0)
+            #     keep_going_array.fill_(0)
+            #     print(keep_going_array.ptr)
+            #     container_flood = self.neon_container_dict["container_flood_fill"](solid_mask, flood_mask, flood_mask_out, keep_going_array, level)
+            #     container_flood.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            #     wp.synchronize()
+            #     keep_going = keep_going_array.numpy()
+            #     growth += keep_going[0]
+            #     done = (keep_going[0] == 0)
+            #     flood_mask, flood_mask_out = flood_mask_out, flood_mask
+            #     # done = self.read_field(keep_going_array, 0, 0) == 0
+            #     print(f"Flood fill iter {iters} grew {keep_going[0]} voxels")
+            #     iters += 1
+            #     # done = True
             
-            print(f"Flood fill completed in {iters} iterations, filled {growth} voxels")
+            # print(f"Flood fill completed in {iters} iterations, filled {growth} voxels")
 
-            connectivity = wp.zeros((num_seeds+1, num_seeds+1), dtype=wp.int64)
-            # comp_counts = wp.zeros(num_seeds+1, dtype=wp.int64)
-            comp_counts = wp.zeros(num_seeds+1, dtype=wp.int32)
+            # # if level == 0:
+            # wp.synchronize()
+            # flood_mask.update_host(stream=0)
+            # # # solid_mask.update_host(stream=0)
+            # # wp.synchronize()
+            # flood_mask.export_vti("flood_mask","mask")
+            # # # solid_mask.export_vti("solid_mask","mask")
+
+            # # sys.exit(0)
+
+            # connectivity = wp.zeros((num_seeds+1, num_seeds+1), dtype=wp.int64)
+            # # comp_counts = wp.zeros(num_seeds+1, dtype=wp.int64)
+            # comp_counts = wp.zeros(num_seeds+1, dtype=wp.int32)
             
-            # Could check connectivity and count components here
-            container_comp = self.neon_container_dict["container_comp_counts"](solid_mask, flood_mask, connectivity, comp_counts, level)
-            container_comp.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            # # Could check connectivity and count components here
+            # container_comp = self.neon_container_dict["container_comp_counts"](solid_mask, flood_mask, connectivity, comp_counts, level)
+            # container_comp.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            # wp.synchronize()
             
-            print(connectivity.numpy())
-            # Create a list of lists to hold connected components and another list that counts the total number of elements in each component
-            components = find_connected_components(connectivity.numpy())
-            print("Connected Components:")
-            print(components)
-            print(comp_counts.numpy())
+            # print(connectivity.numpy())
+            # # Create a list of lists to hold connected components and another list that counts the total number of elements in each component
+            # components = find_connected_components(connectivity.numpy())
+            # print("Connected Components:")
+            # print(components)
+            # print(comp_counts.numpy())
 
-            component_sizes = calculate_component_sizes(components, comp_counts.numpy())
-            print("Component Sizes:")
-            print(component_sizes)
+            # component_sizes = calculate_component_sizes(components, comp_counts.numpy())
+            # print("Component Sizes:")
+            # print(component_sizes)
 
-            largest_component_index = np.argmax(component_sizes)
-            seed_map = map_seeds_to_zero_one(components, largest_component_index, num_seeds)
-            print("Seed Map (1 for largest component, 0 for others):")
-            print(seed_map)
+            # largest_component_index = np.argmax(component_sizes)
+            # seed_map = map_seeds_to_zero_one(components, largest_component_index, num_seeds)
+            # # seed_map = np.arange(num_seeds+1, dtype=int)
+            # print("Seed Map (1 for largest component, 0 for others):")
+            # print(seed_map)
+            # print(seed_map.shape)
 
-            # comp_map = wp.array(seed_map, dtype=wp.int32)
-            comp_map = wp.from_numpy(seed_map, dtype=wp.int32)
-            container_update_solid = self.neon_container_dict["container_update_solid"](solid_mask, flood_mask, comp_map, level)
-            container_update_solid.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            # # comp_map = wp.array(seed_map, dtype=wp.int32)
+            # comp_map = wp.from_numpy(seed_map, dtype=wp.int32)
+            # # container_update_solid = self.neon_container_dict["container_update_solid"](solid_mask, flood_mask, comp_map, level)
+            # # container_update_solid.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+            # wp.synchronize()
 
+            # print("Updated solid mask")
+
+            wp.synchronize()
+            solid_mask.update_host(stream=0)
+            # # solid_mask.update_host(stream=0)
+            # wp.synchronize()
+            solid_mask.export_vti("solid_mask","mask")
+
+            # print("Mesh id: ", mesh_id.value)
+
+            # solid_mask.fill_run(level=level, value=wp.uint8(0), stream_idx=stream)
+            # wp.synchronize()
+            
             container_aabb = self.neon_container_dict["container_aabb"](
                 mesh_id, bc_id, distances, bc_mask, missing_mask, solid_mask, wp.static(bc.needs_mesh_distance), level
             )
             container_aabb.run(0, container_runtime=neon.Container.ContainerRuntime.neon)
+
+            wp.synchronize()
+            sys.exit(0)
 
         return distances, bc_mask, missing_mask
